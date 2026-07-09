@@ -21,17 +21,16 @@ export AWS_DEFAULT_REGION="us-east-1"
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# Destroy Lambda functions and API Gateway
+# Destroy Lambdas, Cognito, and the AgentCore Gateway
 # ------------------------------------------------------------------------------
 
 # Removes all infrastructure including:
-#   - Six cost-query Lambdas + the MCP router Lambda
+#   - Six cost-query Lambdas + their scoped Cost Explorer roles
+#   - AgentCore Gateway + its six MCP tool targets + gateway IAM role
 #   - Cognito user pool, Hosted UI domain, and MCP OAuth client
-#   - OAuth state DynamoDB table
-#   - API Gateway (HTTP API) and routes/integrations
-#   - IAM roles and inline policies
 # provisioned by Terraform in the 01-lambdas directory.
-echo "NOTE: Destroying Lambdas and API Gateway..."
+# Note: tearing down the AgentCore Gateway can take several minutes.
+echo "NOTE: Destroying Lambdas, Cognito, and AgentCore Gateway..."
 
 cd 01-lambdas || {
   echo "ERROR: Directory 01-lambdas not found."

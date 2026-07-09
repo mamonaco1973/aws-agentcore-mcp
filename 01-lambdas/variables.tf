@@ -23,3 +23,18 @@ variable "test_user_password" {
   default     = ""
   sensitive   = true
 }
+
+# --------------------------------------------------------------------------------
+# MCP client OAuth redirect URLs — Cognito requires an EXACT match, so these must
+# be the precise callback(s) the connector uses. Defaults cover claude.ai /
+# claude.com custom connectors. If your client uses a different (e.g. org-scoped)
+# redirect, add it here — or front the Gateway with the DCR shim (see README).
+# --------------------------------------------------------------------------------
+variable "mcp_callback_urls" {
+  description = "Exact OAuth callback URLs allowed for the MCP Cognito client."
+  type        = list(string)
+  default = [
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+  ]
+}

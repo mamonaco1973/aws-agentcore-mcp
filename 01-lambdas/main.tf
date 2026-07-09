@@ -1,11 +1,20 @@
 # ==========================================================================================
-# AWS Provider Configuration
+# Terraform + AWS Provider Configuration
 # ------------------------------------------------------------------------------------------
 # Purpose:
 #   - Defines the AWS provider and its default region for all Terraform resources
-#   - Ensures all modules and resources are deployed within the same region
-#   - This configuration is required before any AWS resource declarations
+#   - Pins a provider new enough to include the AgentCore Gateway resources
+#     (aws_bedrockagentcore_gateway / _gateway_target were added in the 6.x line)
 # ==========================================================================================
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 6.32"
+    }
+  }
+}
 
 provider "aws" {
   region = "us-east-1" # Primary AWS region (N. Virginia)

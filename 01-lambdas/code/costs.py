@@ -5,18 +5,24 @@ This module consolidates all six cost query tools into a single Python file.
 Each tool is a top-level handler wired to its own Lambda function and IAM role
 via Terraform, while sharing the boto3 Cost Explorer client and date helpers.
 
-Handler → Lambda function → API Gateway route mapping:
-    mtd_handler          →  cost-mtd          →  POST /cost/month-to-date
-    by_service_handler   →  cost-by-service   →  POST /cost/by-service
-    compare_handler      →  cost-compare      →  POST /cost/compare-months
-    daily_handler        →  cost-daily        →  POST /cost/daily-trend
-    top_drivers_handler  →  cost-top-drivers  →  POST /cost/top-drivers
-    forecast_handler     →  cost-forecast     →  POST /cost/forecast
+Handler → Lambda function → MCP tool mapping:
+    mtd_handler          →  cost-mtd          →  get_month_to_date_cost
+    by_service_handler   →  cost-by-service   →  get_cost_by_service
+    compare_handler      →  cost-compare      →  compare_this_month_to_last_month
+    daily_handler        →  cost-daily        →  get_daily_cost_trend
+    top_drivers_handler  →  cost-top-drivers  →  find_top_cost_drivers
+    forecast_handler     →  cost-forecast     →  forecast_month_end_cost
+
+Each Lambda is registered as an AgentCore Gateway target (see gateway.tf). The
+tool name, description, and inputSchema are declared in the target's tool_schema
+block, so there is no in-code tool registry in this version.
 
 Response format:
-    All handlers return plain-text summaries in the response body rather than
-    raw Cost Explorer JSON. This lets the AI narrate results naturally without
-    parsing nested ResultsByTime arrays.
+    Handlers return a plain-text summary string, which AgentCore Gateway relays
+    verbatim as the MCP tool result. This lets the AI narrate results without
+    parsing nested ResultsByTime arrays. (In the API-Gateway version these were
+    wrapped in an HTTP proxy envelope; Gateway Lambda targets use the raw return
+    value instead.)
 
 Cost Explorer notes:
     - CE is a global AWS service — the boto3 client always targets us-east-1.
@@ -26,13 +32,12 @@ Cost Explorer notes:
       raise DataUnavailableException on brand-new accounts.
 
 Authentication:
-    These handlers are not exposed through API Gateway. The MCP router Lambda
-    (router.py → mcp.py) invokes them via lambda:InvokeFunction after validating
-    the caller's Cognito OAuth token. Each function keeps its own least-privilege
+    These handlers are not exposed directly. AgentCore Gateway validates the
+    caller's Cognito JWT (its CUSTOM_JWT authorizer) and then invokes the target
+    Lambda with the Gateway's IAM role. Each function keeps its own least-privilege
     execution role scoped to ce:GetCostAndUsage and/or ce:GetCostForecast.
 """
 
-import json
 from datetime import datetime, timezone, timedelta
 from calendar import monthrange
 
@@ -53,36 +58,36 @@ ce = boto3.client("ce", region_name="us-east-1")
 # ---------------------------------------------------------------------------
 
 def _audit_log(event: dict, tool: str) -> None:
-    """Log the tool invocation with the calling user for audit purposes.
+    """Log the tool invocation for audit purposes.
 
-    The MCP router forwards the authenticated Cognito user's email in the
-    x-mcp-user header of the invoke payload (mcp._invoke_tool). Unlike the old
-    proxy's self-reported username, this value is derived from a validated OAuth
-    token, so it is a real caller identity.
+    Caller identity is enforced upstream by the Gateway's CUSTOM_JWT authorizer
+    (a validated Cognito token), so it is not re-derived here. The event holds
+    only the tool's input arguments. `event` is kept in the signature for call-
+    site symmetry across handlers.
 
     Args:
-        event (dict): Invoke payload built by the router ({"headers": {...}}).
+        event (dict): Tool input arguments passed by AgentCore Gateway (unused).
         tool (str): Name of the MCP tool being invoked.
     """
-    user = (event.get("headers") or {}).get("x-mcp-user", "unknown")
-    print(f"AUDIT tool={tool} user={user}")
+    print(f"AUDIT tool={tool}")
 
 
-def _response(status_code: int, text: str) -> dict:
-    """Build an API Gateway v2 HTTP response with a plain-text body.
+def _response(status_code: int, text: str) -> str:
+    """Return the plain-text tool result for AgentCore Gateway.
+
+    Gateway relays a Lambda target's return value straight to the client as the
+    MCP tool result, so we return the summary string directly. `status_code` is
+    accepted for call-site symmetry (some handlers pass 500 on error) but is not
+    encoded in the response — an error simply comes back as its text.
 
     Args:
-        status_code (int): HTTP status code to return.
-        text (str): Plain-text response body for AI narration.
+        status_code (int): Legacy status hint from call sites (unused).
+        text (str): Plain-text summary for AI narration.
 
     Returns:
-        dict: Response dict with statusCode, headers, and body.
+        str: The summary text, used verbatim as the tool result.
     """
-    return {
-        "statusCode": status_code,
-        "headers": {"Content-Type": "text/plain"},
-        "body": text,
-    }
+    return text
 
 
 def _mtd_window():
@@ -153,51 +158,12 @@ def _sum_cost(response: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Tool registry
+# Tool metadata
 # ---------------------------------------------------------------------------
-# Single source of truth for MCP tool metadata. Each entry includes the
-# standard MCP fields (name, description, inputSchema) plus a route field
-# that maps the tool to its API Gateway path. Returned by tools_handler so
-# the proxy can self-configure at startup without hardcoded tool lists.
-
-TOOL_REGISTRY = [
-    {
-        "name": "get_month_to_date_cost",
-        "description": "Returns total AWS spend from the first of this month through today.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/month-to-date",
-    },
-    {
-        "name": "get_cost_by_service",
-        "description": "Returns month-to-date AWS spend broken down by service, sorted descending.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/by-service",
-    },
-    {
-        "name": "compare_this_month_to_last_month",
-        "description": "Compares this month MTD spend against last month full total.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/compare-months",
-    },
-    {
-        "name": "get_daily_cost_trend",
-        "description": "Returns day-by-day AWS spend for the current month with running totals.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/daily-trend",
-    },
-    {
-        "name": "find_top_cost_drivers",
-        "description": "Returns the top 10 AWS services by spend this month with percentage share.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/top-drivers",
-    },
-    {
-        "name": "forecast_month_end_cost",
-        "description": "Forecasts remaining AWS spend through end of month with an 80% confidence range.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "route": "/cost/forecast",
-    },
-]
+# Unlike the API-Gateway version, tool name / description / inputSchema are NOT
+# defined here. AgentCore Gateway owns that metadata: each Lambda is registered
+# as a gateway target whose tool_schema block (gateway.tf) declares the tool the
+# model sees. The mapping of handler → tool name is in the module docstring.
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +174,11 @@ def mtd_handler(event, context):
     """Return total AWS spend from the first of this month to today.
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with a plain-text MTD cost summary.
-              500 on Cost Explorer API failure.
+        str: Plain-text MTD cost summary, or an error message on CE failure.
     """
     _audit_log(event, "get_month_to_date_cost")
     start, end = _mtd_window()
@@ -240,12 +205,11 @@ def by_service_handler(event, context):
     """Return MTD cost broken down by AWS service, sorted descending.
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with a per-service cost breakdown.
-              500 on Cost Explorer API failure.
+        str: Per-service cost breakdown, or an error message on CE failure.
     """
     _audit_log(event, "get_cost_by_service")
     start, end = _mtd_window()
@@ -283,12 +247,11 @@ def compare_handler(event, context):
     """Compare total cost between this month (MTD) and last month (full).
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with a month-over-month comparison summary.
-              500 on Cost Explorer API failure.
+        str: Month-over-month comparison, or an error message on CE failure.
     """
     _audit_log(event, "compare_this_month_to_last_month")
     this_start, this_end = _mtd_window()
@@ -331,12 +294,11 @@ def daily_handler(event, context):
     """Return the daily cost trend for the current month.
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with one line per day showing spend.
-              500 on Cost Explorer API failure.
+        str: One line per day of spend, or an error message on CE failure.
     """
     _audit_log(event, "get_daily_cost_trend")
     start, end = _mtd_window()
@@ -371,12 +333,11 @@ def top_drivers_handler(event, context):
     """Return the top 10 AWS cost drivers for the current month.
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with a ranked list of services by spend and share.
-              500 on Cost Explorer API failure.
+        str: Ranked list of services by spend, or an error message on CE failure.
     """
     _audit_log(event, "find_top_cost_drivers")
     start, end = _mtd_window()
@@ -421,13 +382,12 @@ def forecast_handler(event, context):
     day of the current month, including a confidence interval.
 
     Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
+        event (dict): Tool input arguments from AgentCore Gateway (unused).
         context (obj): Lambda context object (unused).
 
     Returns:
-        dict: 200 with forecast amount and confidence range.
-              200 with an explanatory message if no forecast is needed.
-              500 on Cost Explorer API failure or insufficient history.
+        str: Forecast amount and confidence range, an explanatory note when no
+             forecast is needed, or an error message on failure.
     """
     _audit_log(event, "forecast_month_end_cost")
     now = datetime.now(timezone.utc)
@@ -479,24 +439,3 @@ def forecast_handler(event, context):
         f"  80% confidence range:      ${low:,.2f} – ${high:,.2f}",
     ]
     return _response(200, "\n".join(lines))
-
-
-def tools_handler(event, context):
-    """Return the MCP tool registry for proxy self-configuration.
-
-    Each entry includes the standard MCP tool fields (name, description,
-    inputSchema) plus a route field the proxy uses to map tool calls to
-    API Gateway paths. The proxy strips route before forwarding to the AI.
-
-    Args:
-        event (dict): API Gateway v2 HTTP event (no fields consumed).
-        context (obj): Lambda context object (unused).
-
-    Returns:
-        dict: 200 with a JSON array of tool descriptors.
-    """
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(TOOL_REGISTRY),
-    }

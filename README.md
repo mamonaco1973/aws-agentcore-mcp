@@ -1,183 +1,123 @@
-# AWS Cognito MCP — Cost Explorer Connector
+# AWS AgentCore MCP — Cost Explorer Connector
 
-This project delivers a **remote MCP (Model Context Protocol) connector** on AWS
-that lets Claude query AWS costs in plain English — secured with **Amazon Cognito
-OAuth 2.0**. Claude connects **directly** to a remote `https://…/mcp` endpoint,
-signs the user in through Cognito's Hosted UI, and calls the cost tools.
+This project exposes six AWS **Cost Explorer** tools to Claude as a remote **MCP
+(Model Context Protocol)** connector — built on **Amazon Bedrock AgentCore
+Gateway** with an **Amazon Cognito** JWT authorizer. AgentCore Gateway turns each
+Lambda into an MCP tool and enforces inbound OAuth, so there is **no hand-written
+OAuth proxy, MCP protocol handler, or API Gateway** in this repo.
 
-**There is no local proxy, no SigV4 signing, and no API keys to distribute.**
+It uses **Terraform** and **Python (boto3)**. The Lambda tool logic is identical
+to the hand-built version — only the front door changed.
 
-It uses **Terraform** and **Python (boto3)** to provision and deploy the backend.
-The only thing a user does is paste one URL into their MCP client.
+> ## Two versions, one comparison
+> This is **V2**. Its sibling repo **`aws-cognito-mcp`** (V1) implements the exact
+> same six cost tools with a *hand-rolled* front door: an OAuth 2.0
+> authorization-server proxy (`oauth.py`), an MCP JSON-RPC handler (`mcp.py`), a
+> router Lambda, and an HTTP API — roughly 700 lines of plumbing. **V2 deletes
+> almost all of it** and lets AgentCore Gateway do the work. The interesting part
+> is what the managed service *doesn't* do — see **Connecting Claude** below.
 
-> This is the Cognito port of [`aws-serverless-mcp`](https://github.com/mamonaco1973/aws-serverless-mcp),
-> which secured the API with AWS IAM and required a local SigV4-signing proxy
-> script. The OAuth authorization-server proxy pattern is the key enabler for
-> going proxy-free.
+## Architecture
 
-![diagram](aws-serverless-mcp.png)
+```
+Claude ──OAuth (code+PKCE) → Cognito──▶ Cognito access token
+Claude ──MCP over HTTPS, Bearer token──▶ AgentCore Gateway
+                                          │  CUSTOM_JWT authorizer (validates
+                                          │  token vs Cognito OIDC + allowed_clients)
+                                          │  assumes its IAM role to invoke:
+                                          ├─▶ Lambda cost-mtd, cost-by-service, …
+                                          └─▶ Cost Explorer (us-east-1)
+```
 
-> ⚠️ The diagram images and `00-resources/` still show the previous IAM + local
-> proxy design and will be regenerated.
+## What gets built
 
-## How it works
-
-An **API Gateway HTTP API** fronts a single **router Lambda**. Every route is
-public at the gateway — authentication is enforced inside the Lambda:
-
-1. **Discovery** — Claude fetches `GET /.well-known/oauth-authorization-server`
-   and learns this API is its OAuth authorization server.
-2. **Registration** — Claude self-registers via `POST /oauth/register` (RFC 7591)
-   and receives the shared MCP `client_id`.
-3. **Login** — Claude opens `GET /authorize`; the Lambda redirects the browser to
-   Cognito's Hosted UI. After the user signs in, Cognito calls back to
-   `GET /oauth/callback`.
-4. **Token** — Claude exchanges a one-time code at `POST /oauth/token` for a real
-   Cognito access token.
-5. **Use** — Claude calls `POST /mcp` with `Authorization: Bearer <token>`. The
-   Lambda validates the token via Cognito's `/oauth2/userInfo` endpoint, then
-   invokes the appropriate cost Lambda.
-
-### Why an OAuth proxy?
-
-claude.ai uses a dynamic `redirect_uri` containing its org ID, which Cognito's
-exact-match allow-list rejects. `oauth.py` solves this by advertising **our API**
-as the authorization server, registering only our fixed `/oauth/callback` with
-Cognito, and brokering the flow — handing Claude a genuine Cognito access token
-without Cognito ever seeing claude.ai's URL.
-
-Key capabilities demonstrated:
-
-1. **Remote MCP over OAuth** — Claude connects to the remote endpoint natively;
-   no local runtime on the caller's machine.
-2. **Cognito-secured** — every `/mcp` call carries a validated Cognito access
-   token tied to a real user account.
-3. **Authorization-server proxy** — `oauth.py` implements RFC 8414 metadata, RFC
-   7591 dynamic registration, and the full authorize→callback→token flow.
-4. **Least-privilege fan-out** — the router holds only `lambda:InvokeFunction` on
-   the seven cost Lambdas; each cost Lambda keeps its own scoped Cost Explorer
-   role.
-5. **Infrastructure as Code** — Terraform provisions Lambdas, Cognito, DynamoDB,
-   IAM, and API Gateway in a single apply.
+- **6 cost Lambdas** (`cost-mtd`, `cost-by-service`, `cost-compare`, `cost-daily`,
+  `cost-top-drivers`, `cost-forecast`), each with a least-privilege Cost Explorer
+  role. Logic unchanged from V1; they return plain-text summaries.
+- **AgentCore Gateway** (`protocol_type = MCP`) with a **CUSTOM_JWT** authorizer
+  bound to the Cognito pool, and **six Gateway targets** (one per Lambda) whose
+  `tool_schema` declares the MCP tool the model sees.
+- **Gateway IAM role** scoped to `lambda:InvokeFunction` on exactly those six.
+- **Cognito** user pool + Hosted UI domain + MCP app client (the OAuth server).
 
 ## Prerequisites
 
 * [An AWS Account](https://aws.amazon.com/console/) with Cost Explorer enabled
-  (Billing console → Cost Explorer → Enable)
 * [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-* [Terraform](https://developer.hashicorp.com/terraform/install)
-* `jq` in PATH (used by `apply.sh` / `validate.sh`)
-* An MCP client that supports remote connectors with OAuth (claude.ai custom
-  connectors, or Claude Desktop with a remote server URL)
-
-## Download
-
-```bash
-git clone https://github.com/mamonaco1973/aws-cognito-mcp.git
-cd aws-cognito-mcp
-```
+  and [Terraform](https://developer.hashicorp.com/terraform/install)
+  (**AWS provider ≥ 6.32** — required for the AgentCore resources; pinned in `main.tf`)
+* `jq` in PATH
+* Access to Amazon Bedrock AgentCore in your account/region
 
 ## Deploy
 
 ```bash
-# Optional: seed a ready-to-use login (otherwise create a user manually, below)
+# Optional: seed a ready-to-log-in Cognito user
 export TF_VAR_test_user_email="you@example.com"
 export TF_VAR_test_user_password="ChangeMe-Str0ng!"
 
 ./apply.sh
 ```
 
-`apply.sh`:
-1. `check_env.sh` — validates tools and AWS credentials.
-2. `terraform apply` in `01-lambdas/` — deploys the six cost Lambdas, the router
-   Lambda, Cognito (user pool + Hosted UI + MCP client), the OAuth state table,
-   and the HTTP API.
-3. `validate.sh` — direct-invokes each cost Lambda to confirm Cost Explorer
-   connectivity.
-4. Prints the **connector URL** and how to add it to Claude.
+`apply.sh` validates the environment, `terraform apply`s the stack (creating the
+Gateway can take a few minutes), direct-invokes each cost Lambda to confirm Cost
+Explorer connectivity, and prints the MCP endpoint + OAuth client credentials.
 
-### Connect Claude
+## Connecting Claude
 
-1. In claude.ai: **Settings → Connectors → Add custom connector**.
-2. Paste the printed URL (`https://<api-id>.execute-api.us-east-1.amazonaws.com/mcp`).
-3. Click **Connect**. On the Cognito page, new users click **Sign up** to
-   self-register (email verification), then sign in — the six cost tools appear.
+**This is not one-click**, and that is the whole lesson of V2.
 
-> **Self-signup is open by default.** Anyone who can reach the connector URL can
-> register and read your AWS cost data. Keep the endpoint private, or lock it
-> down: add a Cognito **pre-sign-up Lambda trigger** to allowlist email domains,
-> or set `allow_admin_create_user_only = true` in `cognito.tf` for admin-only
-> provisioning.
+AgentCore Gateway does **not** serve the MCP OAuth discovery endpoints (RFC 8414
+metadata, RFC 7591 dynamic client registration), and Cognito doesn't support DCR.
+So Claude cannot auto-register. You have two options:
 
-### Pre-create a user (instead of self-signup)
+1. **Manual credentials (default).** In claude.ai → Settings → Connectors → Add
+   custom connector, paste the Gateway MCP URL and supply the `client_id` /
+   `client_secret` from `apply.sh`. The connector's redirect URL must be one of
+   `var.mcp_callback_urls` (defaults cover claude.ai / claude.com); Cognito needs
+   an exact match, so add yours and re-apply if it differs.
+2. **DCR shim.** Front the Gateway with a small service that serves the
+   discovery + `/register` endpoints and brokers Cognito — essentially V1's
+   `oauth.py`. Not included here (see the repo's CLAUDE.md → "Deferred").
+   References: [awslabs/agentcore-samples #1056](https://github.com/awslabs/agentcore-samples/issues/1056),
+   [stache-ai/agentcore-dcr](https://github.com/stache-ai/agentcore-dcr).
 
-```bash
-POOL=$(cd 01-lambdas && terraform output -raw cognito_user_pool_id)
+> **The takeaway:** the managed service removed ~700 lines of our plumbing, but
+> the last-mile OAuth discovery for claude.ai still wants the hand-built piece.
+> Understanding V1 is what lets you diagnose and fix that in minutes.
 
-aws cognito-idp admin-create-user \
-  --user-pool-id "$POOL" \
-  --username you@example.com \
-  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true
-
-aws cognito-idp admin-set-user-password \
-  --user-pool-id "$POOL" \
-  --username you@example.com \
-  --password 'YourPassw0rd!' --permanent
-```
+Users self-register through the Cognito Hosted UI (**open signup** — anyone who
+can reach the login can read your cost data; keep it private or lock it down), or
+you pre-create one with `aws cognito-idp admin-create-user`.
 
 ## Teardown
 
 ```bash
-./destroy.sh
+./destroy.sh    # Gateway teardown can take several minutes
 ```
 
----
-
 ## MCP Tools
-
-All six tools take no input and return plain-text summaries suitable for direct
-narration.
 
 | Tool | Backing Lambda | Description |
 |------|----------------|-------------|
 | `get_month_to_date_cost` | `cost-mtd` | Total AWS spend from the 1st of this month through today |
-| `get_cost_by_service` | `cost-by-service` | MTD spend broken down by service, sorted descending |
+| `get_cost_by_service` | `cost-by-service` | MTD spend by service, sorted descending |
 | `compare_this_month_to_last_month` | `cost-compare` | This month MTD vs last month full total |
-| `get_daily_cost_trend` | `cost-daily` | Day-by-day spend for the current month with running totals |
-| `find_top_cost_drivers` | `cost-top-drivers` | Top 10 services by spend with percentage share |
-| `forecast_month_end_cost` | `cost-forecast` | Projected remaining spend through end of month (80% CI) |
+| `get_daily_cost_trend` | `cost-daily` | Day-by-day spend with running totals |
+| `find_top_cost_drivers` | `cost-top-drivers` | Top 10 services by spend with % share |
+| `forecast_month_end_cost` | `cost-forecast` | Projected remaining spend (80% CI) |
 
-`tools/list` is served from `TOOL_REGISTRY` in `costs.py` (the single source of
-truth), fetched by the router from the `cost-tools` Lambda.
+Tool metadata is declared in each Gateway target's `tool_schema` (`gateway.tf`),
+not in code.
 
-### Example responses
+## V1 vs V2 at a glance
 
-**`get_month_to_date_cost`**
-```
-Month-to-date AWS cost (2026-04-01 through 2026-04-27): $142.38 USD
-```
-
-**`find_top_cost_drivers`**
-```
-Top AWS cost drivers (2026-04-01 through 2026-04-27):
-   1. Amazon EC2: $87.14 (61.2% of total)
-   2. Amazon RDS: $31.20 (21.9% of total)
-   ...
-  Total across all services: $142.38
-```
-
----
-
-## HTTP surface
-
-| Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------|
-| `/.well-known/oauth-authorization-server` | GET | public | RFC 8414 metadata |
-| `/oauth/register` | POST | public | RFC 7591 dynamic registration |
-| `/authorize` | GET | public | Start Cognito login |
-| `/oauth/callback` | GET | public | Cognito redirect target |
-| `/oauth/token` | POST | public | Exchange code → Cognito access token |
-| `/mcp` | POST | **Bearer (Cognito)** | MCP JSON-RPC |
-
-The OAuth endpoints are public because they *are* the authentication; `/mcp`
-validates the Bearer token inside the Lambda.
+| | V1 `aws-cognito-mcp` | V2 `aws-agentcore-mcp` |
+|---|---|---|
+| MCP protocol | hand-written `mcp.py` | AgentCore Gateway |
+| Inbound auth | `oauth.py` proxy + `/oauth2/userInfo` | Gateway CUSTOM_JWT authorizer |
+| Transport | API Gateway HTTP API | Gateway endpoint |
+| Tool → Lambda | router `lambda:InvokeFunction` | Gateway targets |
+| claude.ai connect | one-click (proxy does DCR) | manual creds, or add a DCR shim |
+| Extra state | DynamoDB (OAuth codes) | none |
+| Lines of front-door code | ~700 | ~0 (Terraform config) |

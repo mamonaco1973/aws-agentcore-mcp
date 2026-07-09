@@ -2,21 +2,20 @@
 # File: cognito.tf
 #
 # Purpose:
-#   Provisions the Cognito identity layer that secures the MCP connector. Claude
-#   (claude.ai / Claude Desktop) authenticates the human via Cognito's Hosted UI,
-#   receives a Bearer access token through the OAuth flow in oauth.py, and sends
-#   it on every POST /mcp call. mcp.py validates the token against Cognito's
-#   /oauth2/userInfo endpoint.
+#   Cognito identity layer for the AgentCore Gateway connector. Cognito is the
+#   OAuth authorization server AND the JWT issuer that AgentCore Gateway trusts:
+#   the Gateway's CUSTOM_JWT authorizer validates every incoming token against
+#   this user pool's OIDC discovery document, and only accepts tokens minted for
+#   the MCP app client below.
 #
-# Why Cognito instead of the old IAM proxy:
-#   The previous design signed each request with SigV4 from a local proxy script.
-#   MCP clients cannot sign SigV4, so a local runtime was mandatory. Cognito OAuth
-#   is a protocol Claude speaks natively — the proxy disappears entirely.
+# Difference from the hand-built (aws-cognito-mcp) version:
+#   There, our own Lambda validated tokens via /oauth2/userInfo and we ran an
+#   OAuth proxy to broker claude.ai's dynamic redirect_uri. Here the Gateway does
+#   JWT validation natively — but it does NOT serve the MCP OAuth discovery / RFC
+#   7591 registration endpoints, so claude.ai still needs help connecting. See
+#   the "Connecting Claude" section in README.md.
 # ================================================================================
 
-# --------------------------------------------------------------------------------
-# Locals — a random suffix keeps the Hosted-UI domain globally unique per deploy.
-# --------------------------------------------------------------------------------
 resource "random_id" "suffix" {
   byte_length = 4
 }
@@ -25,7 +24,7 @@ resource "random_id" "suffix" {
 # Cognito User Pool — the directory of humans allowed to use the cost tools
 # ================================================================================
 resource "aws_cognito_user_pool" "mcp" {
-  name = "cost-mcp-user-pool-${random_id.suffix.hex}"
+  name = "cost-agentcore-user-pool-${random_id.suffix.hex}"
 
   username_attributes      = ["email"]
   auto_verified_attributes = ["email"]
@@ -52,34 +51,35 @@ resource "aws_cognito_user_pool" "mcp" {
     }
   }
 
-  # Open self-service sign-up: anyone can register through the Hosted UI "Sign up"
-  # link and then use the cost tools. This is the AWS default, set explicitly so
-  # the intent is documented and a later apply doesn't silently change it.
-  # NOTE: this exposes AWS cost data to anyone who can reach the connector URL —
-  # keep the endpoint private, or switch to a pre-sign-up domain allowlist /
-  # allow_admin_create_user_only = true if that is too open.
+  # Open self-service sign-up (AWS default, set explicitly). This exposes AWS
+  # cost data to anyone who can reach the login — keep the connector private or
+  # lock it down. Same posture as the V1 project.
   admin_create_user_config {
     allow_admin_create_user_only = false
   }
 }
 
 # ================================================================================
-# Cognito Hosted UI domain — where the user actually types their credentials
+# Cognito Hosted UI domain — where the user authenticates during the OAuth flow
 # ================================================================================
 resource "aws_cognito_user_pool_domain" "mcp" {
-  domain       = "cost-mcp-auth-${random_id.suffix.hex}"
+  domain       = "cost-agentcore-auth-${random_id.suffix.hex}"
   user_pool_id = aws_cognito_user_pool.mcp.id
 }
 
 # ================================================================================
-# Cognito User Pool Client — MCP OAuth (confidential client with a secret)
+# Cognito User Pool Client — the MCP connector client
 #
-# The client secret lives only in the router Lambda's env, never in a browser or
-# in the MCP client. Only our own /oauth/callback URL is registered — claude.ai's
-# dynamic redirect_uri is brokered by the proxy in oauth.py, not by Cognito.
+# claude.ai drives the authorization-code + PKCE flow against this client and
+# receives a Cognito access token; AgentCore Gateway then accepts that token
+# because the client id is in the Gateway's allowed_clients list (gateway.tf).
+#
+# generate_secret = true supports the "paste client id + secret into the
+# connector" path. The callback URLs must include the exact redirect the MCP
+# client uses (see var.mcp_callback_urls).
 # ================================================================================
 resource "aws_cognito_user_pool_client" "mcp" {
-  name         = "cost-mcp-${random_id.suffix.hex}"
+  name         = "cost-agentcore-mcp-${random_id.suffix.hex}"
   user_pool_id = aws_cognito_user_pool.mcp.id
 
   generate_secret = true
@@ -90,10 +90,8 @@ resource "aws_cognito_user_pool_client" "mcp" {
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
 
-  # Claude holds the access token for the whole session and has no refresh flow,
-  # so issue the Cognito maximum. oauth_token() reports this same 24h lifetime —
-  # underreporting makes the client attempt an unsupported refresh and drop the
-  # session after 1 hour.
+  # Claude holds the token for the session and has no refresh flow — issue the
+  # Cognito maximum so the session doesn't drop mid-use.
   access_token_validity = 24
   token_validity_units {
     access_token = "hours"
@@ -101,16 +99,20 @@ resource "aws_cognito_user_pool_client" "mcp" {
 
   supported_identity_providers = ["COGNITO"]
 
-  # Only our server-side callback — the proxy re-issues to claude.ai's real URL.
-  callback_urls = ["${aws_apigatewayv2_api.costs_api.api_endpoint}/oauth/callback"]
+  # The MCP client's redirect target(s). Cognito requires an exact match, so
+  # these must be the precise callback URLs the connector uses.
+  callback_urls = var.mcp_callback_urls
+
+  lifecycle {
+    precondition {
+      condition     = length(var.mcp_callback_urls) > 0
+      error_message = "Set at least one mcp_callback_urls entry (the MCP client's OAuth redirect URL)."
+    }
+  }
 }
 
 # ================================================================================
 # Optional test user — seeded only when var.test_user_email is set.
-#
-# Lets ./apply.sh produce a login that works end-to-end for demos. Leave the
-# variables unset in production and create users through the Cognito console or
-# `aws cognito-idp admin-create-user` instead (see README).
 # ================================================================================
 resource "aws_cognito_user" "test" {
   count = var.test_user_email != "" ? 1 : 0
@@ -123,23 +125,34 @@ resource "aws_cognito_user" "test" {
     email_verified = "true"
   }
 
-  # Set a permanent password so the user can log in without a forced reset.
   password       = var.test_user_password
   message_action = "SUPPRESS"
 }
 
 # ================================================================================
-# Outputs — consumed by validate.sh / apply.sh to print connector instructions
+# Outputs
 # ================================================================================
 output "cognito_user_pool_id" {
   value = aws_cognito_user_pool.mcp.id
 }
 
 output "cognito_domain" {
-  description = "Hosted-UI domain prefix (region-qualified URL built by the Lambda)"
+  description = "Hosted-UI domain prefix"
   value       = aws_cognito_user_pool_domain.mcp.domain
 }
 
 output "mcp_client_id" {
   value = aws_cognito_user_pool_client.mcp.id
+}
+
+output "mcp_client_secret" {
+  description = "Paste into the Claude connector (confidential-client path)"
+  value       = aws_cognito_user_pool_client.mcp.client_secret
+  sensitive   = true
+}
+
+# OIDC discovery URL the Gateway uses to validate JWTs, and that the connector's
+# OAuth flow ultimately authenticates against.
+output "cognito_oidc_discovery_url" {
+  value = "https://cognito-idp.${data.aws_region.current.region}.amazonaws.com/${aws_cognito_user_pool.mcp.id}/.well-known/openid-configuration"
 }
