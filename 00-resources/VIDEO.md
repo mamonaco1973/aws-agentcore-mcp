@@ -1,42 +1,40 @@
-#AWS #MCP #ModelContextProtocol #AWSLambda #APIGateway #Terraform #Python #ClaudeDesktop #Serverless #IAM
+#AWS #MCP #AgentCore #Bedrock #ClaudeAI
 
-*Build a Serverless MCP Backend on AWS (Lambda + API Gateway + SigV4)*
+*Build a Remote MCP Server with Amazon Bedrock AgentCore Gateway*
 
-How do you expose serverless AWS tools to any AI client — securely, without managing servers, and without hardcoding anything in the proxy?
+What if AWS wrote the entire MCP front door for you — the protocol, the auth, the routing — and all you had to do was point it at your Lambda functions?
 
-In this project we build a reusable MCP backend pattern on AWS: Lambda functions behind API Gateway with full IAM authorization, bridged to any MCP client by a lightweight stdio proxy that signs every request with SigV4.
+That is what Amazon Bedrock AgentCore Gateway does. In this project we connect Claude directly to our live AWS costs through a managed MCP gateway, secured with Amazon Cognito. Six Lambda functions become six MCP tools. There is no API Gateway, no router function, and no OAuth code — the Gateway speaks the protocol and validates the token for us.
 
-The proxy makes the remote AWS backend look like a local tool server. The AI never knows the difference. We use AWS Cost Explorer as the example backend — but the pattern works for any Lambda-backed tool set.
+Build that front door by hand and it is roughly seven hundred lines of code. Here, it is a single Terraform resource.
 
-The proxy itself contains zero tool-specific logic. It self-configures at startup by calling a /tools discovery endpoint, so you can add or remove tools without touching the proxy at all. Point it at a different endpoint and you have a completely different tool set.
+But there is a catch, and it shows up the moment you try to connect. AgentCore Gateway does not serve the two OAuth routes an MCP client needs in order to connect on its own — discovery (RFC 8414) and dynamic client registration (RFC 7591). So Claude cannot find the login, and it cannot register itself. You paste in an OAuth client ID and a client secret by hand. That is not a bug. It is AWS's documented flow.
 
-This pattern works with Claude Desktop, OpenAI Codex, Cursor, and any other MCP client that supports stdio transport.
+We use AWS Cost Explorer as the example tool set, but the pattern works for any Lambda-backed MCP server. And we finish with an honest comparison, because managed is not automatically better. It is different.
 
 WHAT YOU'LL LEARN
-• The serverless MCP backend pattern — how to make remote Lambda tools appear local to any AI client
-• Writing a stdio MCP proxy in Bash (and PowerShell) that signs requests with AWS SigV4
-• Securing API Gateway routes with AWS_IAM authorization — no API keys to manage or rotate
-• Applying least-privilege IAM — one scoped execution role per Lambda, one proxy user with invoke-only rights
-• Building a self-configuring /tools discovery endpoint so the proxy never needs hardcoded tool definitions
-• Storing and retrieving proxy credentials from Secrets Manager
+• Exposing Lambda functions as MCP tools with Bedrock AgentCore Gateway — no protocol code at all
+• Securing the Gateway with a CUSTOM_JWT authorizer backed by an Amazon Cognito user pool
+• Why AgentCore does not serve OAuth discovery or dynamic client registration, and exactly what that costs you
+• Connecting claude.ai with a manually supplied OAuth client ID and secret — AWS's documented flow
+• Managed versus hand-built — an honest look at what you actually trade away
 
 INFRASTRUCTURE DEPLOYED
-• API Gateway HTTP API v2 — 7 routes, all AWS_IAM authorized (unsigned requests rejected before Lambda runs)
-• 7 Lambda functions (Python 3.14) — 6 example tools + 1 self-configuring tool registry endpoint
-• 7 IAM execution roles — one per Lambda, each scoped to only the permissions that function needs
-• IAM user scoped to execute-api:Invoke on this API only — cannot call any AWS service directly
-• Secrets Manager secret storing proxy credentials (key ID, secret, endpoint, region)
-• MCP proxy (proxy.sh / proxy.ps1) — generic stdio bridge with SigV4 signing, zero tool-specific logic
+• Amazon Bedrock AgentCore Gateway (MCP protocol) with a CUSTOM_JWT authorizer
+• 6 Gateway targets — one per Lambda, each with an inline tool schema the model sees
+• 6 Cost Explorer Lambdas (Python 3.14), each with its own scoped execution role
+• Gateway IAM role scoped to lambda:InvokeFunction on exactly those six functions
+• Amazon Cognito user pool + Hosted UI + confidential OAuth client
+• All provisioned with Terraform in a single apply, torn down with a single command
 
 GitHub
-https://github.com/mamonaco1973/aws-serverless-mcp
+https://github.com/mamonaco1973/aws-agentcore-mcp
 
 README
-https://github.com/mamonaco1973/aws-serverless-mcp/blob/main/README.md
+https://github.com/mamonaco1973/aws-agentcore-mcp/blob/main/README.md
 
 TIMESTAMPS
 00:00 Introduction
-00:17 Architecture
-01:09 Build the Code
-01:25 Build Results
-02:10 Demo
+00:38 Architecture
+01:45 Securing MCP
+02:39 Deploy It Yourself
