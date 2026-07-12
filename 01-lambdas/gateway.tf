@@ -17,29 +17,39 @@
 # the backing Lambda. Drives both the gateway targets and the invoke policy so
 # there is a single source of truth.
 # --------------------------------------------------------------------------------
+# AgentCore Gateway exposes each tool to the client as "<target>___<tool>", and
+# MCP clients cap tool names at 64 characters. Keep `target` SHORT — it is only a
+# namespace prefix. (Using the full tool name as the target blew the limit:
+# compare-this-month-to-last-month___compare_this_month_to_last_month = 67 chars.)
 locals {
   cost_tools = {
     get_month_to_date_cost = {
+      target      = "mtd"
       description = "Returns total AWS spend from the first of this month through today."
       lambda_arn  = aws_lambda_function.lambda_mtd.arn
     }
     get_cost_by_service = {
+      target      = "by-service"
       description = "Returns month-to-date AWS spend broken down by service, sorted descending."
       lambda_arn  = aws_lambda_function.lambda_by_service.arn
     }
     compare_this_month_to_last_month = {
+      target      = "compare"
       description = "Compares this month MTD spend against last month full total."
       lambda_arn  = aws_lambda_function.lambda_compare.arn
     }
     get_daily_cost_trend = {
+      target      = "daily"
       description = "Returns day-by-day AWS spend for the current month with running totals."
       lambda_arn  = aws_lambda_function.lambda_daily.arn
     }
     find_top_cost_drivers = {
+      target      = "top-drivers"
       description = "Returns the top 10 AWS services by spend this month with percentage share."
       lambda_arn  = aws_lambda_function.lambda_top_drivers.arn
     }
     forecast_month_end_cost = {
+      target      = "forecast"
       description = "Forecasts remaining AWS spend through end of month with an 80% confidence range."
       lambda_arn  = aws_lambda_function.lambda_forecast.arn
     }
@@ -109,7 +119,7 @@ resource "aws_bedrockagentcore_gateway" "costs" {
 resource "aws_bedrockagentcore_gateway_target" "cost" {
   for_each = local.cost_tools
 
-  name               = replace(each.key, "_", "-")
+  name               = each.value.target
   gateway_identifier = aws_bedrockagentcore_gateway.costs.gateway_id
 
   credential_provider_configuration {
